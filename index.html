@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Frank Powell Live - SmartSync v10.1</title>
+    <title>Frank Powell Live - SmartSync v10.2</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- HTML2Canvas -->
@@ -36,7 +36,9 @@
             localGigs: [],    
             db: null,
             auth: null,
-            syncInProgress: false
+            syncInProgress: false,
+            listenerUnsubscribe: null,
+            connectionTimeout: null
         };
 
         // --- INITIALIZATION ---
@@ -57,8 +59,15 @@
                 onAuthStateChanged(state.auth, (user) => {
                     state.user = user;
                     if (user) {
-                        updateStatus("Cloud: Connected", "text-green-400");
-                        // We do NOT run sync here. We wait for the data snapshot.
+                        // FIX: Don't show "Connected" (Green) yet. Show "Loading..." (Blue)
+                        updateStatus("Loading Data...", "text-blue-400 animate-pulse");
+                        
+                        // Set a safety timeout to warn user if DB is hanging
+                        clearTimeout(state.connectionTimeout);
+                        state.connectionTimeout = setTimeout(() => {
+                            if (!state.isCloudLoaded) updateStatus("Connection Slow...", "text-amber-500");
+                        }, 10000);
+
                         setupFirestoreListener();
                     } else {
                         signInAnonymously(state.auth).catch(console.error);
@@ -102,19 +111,30 @@
         function setupFirestoreListener() {
             if (!state.user || !state.db) return;
             
+            // Prevent multiple listeners
+            if (state.listenerUnsubscribe) {
+                state.listenerUnsubscribe();
+            }
+            
             const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
             const q = query(toursRef); 
 
-            onSnapshot(q, (snapshot) => {
+            state.listenerUnsubscribe = onSnapshot(q, (snapshot) => {
+                // Clear timeout since we got data
+                clearTimeout(state.connectionTimeout);
+
                 const fetchedGigs = [];
                 snapshot.forEach((doc) => {
                     fetchedGigs.push({ firebaseId: doc.id, ...doc.data() });
                 });
                 
                 state.cloudGigs = fetchedGigs;
-                state.isCloudLoaded = true; // MARKER: Cloud data is ready
+                state.isCloudLoaded = true; // MARKER: Cloud data is TRULY ready
                 
-                // NOW it is safe to sync
+                // NOW we can show Green
+                updateStatus("Cloud: Online", "text-green-400");
+                
+                // Safe to sync
                 cleanLocalDuplicates();
                 runSmartSync(); 
                 renderUnifiedInterface();
@@ -271,8 +291,14 @@
         };
 
         window.manualSync = () => {
+            // FIX: If user is forced to click this and data isn't loaded, try to kickstart the listener
             if(!state.isCloudLoaded) {
-                alert("Please wait for cloud connection...");
+                if(state.user) {
+                    updateStatus("Retrying Connection...", "text-blue-400 animate-pulse");
+                    setupFirestoreListener(); // Kickstart
+                } else {
+                    alert("Not logged in yet. Please wait.");
+                }
                 return;
             }
             runSmartSync();
@@ -375,9 +401,14 @@
         // --- NETWORK LISTENERS ---
         window.addEventListener('online', () => {
             state.isOnline = true;
-            updateStatus("Cloud: Connected", "text-green-400");
-            // Only run sync if we already loaded the cloud data previously
-            if(state.isCloudLoaded) runSmartSync();
+            // FIX: If we came back online but cloud never loaded, try to load it
+            if(state.user && !state.isCloudLoaded) {
+                 updateStatus("Reconnecting...", "text-blue-400 animate-pulse");
+                 setupFirestoreListener();
+            } else if(state.isCloudLoaded) {
+                updateStatus("Cloud: Online", "text-green-400");
+                runSmartSync();
+            }
         });
         window.addEventListener('offline', () => {
             state.isOnline = false;
@@ -526,7 +557,7 @@
 
         <!-- VERSION FOOTER -->
         <div class="mt-auto border-t border-gray-100 pt-4 text-center pb-6">
-            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v10.1</span></h1>
+            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v10.2</span></h1>
             <p class="text-[9px] text-gray-400 uppercase tracking-wider mt-1">Intelligent Hybrid Sync</p>
         </div>
     </div>
