@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Frank Powell Live - SmartSync v11.0</title>
+    <title>Frank Powell Live - SmartSync v11.1</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- HTML2Canvas -->
@@ -43,19 +43,20 @@
         // --- INITIALIZATION ---
         async function initApp() {
             try {
-                // 1. Initialize Firebase
+                // 1. PRIORITY: Load & Render Local Cache Immediately (Optimistic UI)
+                loadLocalStorage();
+                renderUnifiedInterface();
+
+                // 2. Initialize Firebase
                 const app = initializeApp(firebaseConfig);
                 state.auth = getAuth(app);
                 state.db = getFirestore(app);
-
-                // 2. Load Local Storage (The "Offline Cache")
-                loadLocalStorage();
 
                 // 3. Setup Auth Listener
                 onAuthStateChanged(state.auth, (user) => {
                     if (user) {
                         state.user = user;
-                        updateStatus("Connected", "text-blue-400 animate-pulse");
+                        updateStatus("Syncing Cloud...", "text-blue-400 animate-pulse");
                         setupFirestoreListener();
                     } else {
                         state.user = null;
@@ -65,9 +66,6 @@
                         });
                     }
                 });
-
-                // 4. Render Initial State
-                renderUnifiedInterface();
 
             } catch (e) {
                 console.error("Init failed:", e);
@@ -523,7 +521,7 @@
 
         <!-- VERSION FOOTER -->
         <div class="mt-auto border-t border-gray-100 pt-4 text-center pb-6">
-            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v11.0</span></h1>
+            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v11.1</span></h1>
             <p class="text-[9px] text-gray-400 uppercase tracking-wider mt-1">Intelligent Hybrid Sync</p>
         </div>
     </div>
