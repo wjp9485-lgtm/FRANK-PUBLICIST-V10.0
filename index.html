@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Frank Powell Live - SmartSync v10.0</title>
+    <title>Frank Powell Live - SmartSync v10.1</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- HTML2Canvas -->
@@ -18,7 +18,6 @@
         import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy, getDocs, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- FIREBASE CONFIGURATION ---
-        // Using the config provided in your request
         const firebaseConfig = {
             apiKey: "AIzaSyB6wqnpGAVEoBfcLkb3QRNP6UoLpZxlS64",
             authDomain: "frankpowellmusic.firebaseapp.com",
@@ -32,38 +31,70 @@
         const state = {
             user: null,
             isOnline: navigator.onLine,
-            cloudGigs: [],    // Gigs confirmed in Firestore
-            localGigs: [],    // Gigs waiting to be uploaded
+            isCloudLoaded: false, // CRITICAL: Prevents sync before cloud data arrives
+            cloudGigs: [],    
+            localGigs: [],    
             db: null,
-            auth: null
+            auth: null,
+            syncInProgress: false
         };
 
         // --- INITIALIZATION ---
         async function initApp() {
             try {
+                // 1. Migrate Old Data (v9 -> v10)
+                migrateLegacyData();
+
+                // 2. Load Local Data
+                state.localGigs = JSON.parse(localStorage.getItem('frankPowellPending') || '[]');
+
+                // 3. Init Firebase
                 const app = initializeApp(firebaseConfig);
                 state.auth = getAuth(app);
                 state.db = getFirestore(app);
-
-                // Load Local Pending items immediately
-                state.localGigs = JSON.parse(localStorage.getItem('frankPowellPending') || '[]');
                 
-                // Auth Listener
+                // 4. Auth Listener
                 onAuthStateChanged(state.auth, (user) => {
                     state.user = user;
                     if (user) {
                         updateStatus("Cloud: Connected", "text-green-400");
+                        // We do NOT run sync here. We wait for the data snapshot.
                         setupFirestoreListener();
-                        runSmartSync(); // Trigger sync on connect
                     } else {
                         signInAnonymously(state.auth).catch(console.error);
                     }
                 });
 
-                renderUnifiedInterface(); // Initial Render
+                renderUnifiedInterface(); 
             } catch (e) {
                 console.error("Init Error", e);
                 updateStatus("Offline Mode", "text-amber-500");
+            }
+        }
+
+        // --- MIGRATION TOOL ---
+        function migrateLegacyData() {
+            try {
+                const legacy = JSON.parse(localStorage.getItem('frankPowellTour') || '[]');
+                if (legacy.length > 0) {
+                    console.log("Migrating legacy data...", legacy.length);
+                    const currentPending = JSON.parse(localStorage.getItem('frankPowellPending') || '[]');
+                    
+                    legacy.forEach(item => {
+                        // Avoid duplicates if we ran this before
+                        const exists = currentPending.some(p => p.date === item.date && p.venue === item.venue);
+                        if (!exists) {
+                            if(!item.localId) item.localId = 'mig_' + Date.now() + Math.random().toString(36).substr(2, 9);
+                            currentPending.push(item);
+                        }
+                    });
+                    
+                    localStorage.setItem('frankPowellPending', JSON.stringify(currentPending));
+                    localStorage.removeItem('frankPowellTour'); // Clean up old storage
+                    alert(`System Updated: Migrated ${legacy.length} offline gigs to the new sync engine.`);
+                }
+            } catch (e) {
+                console.warn("Migration check failed", e);
             }
         }
 
@@ -72,7 +103,6 @@
             if (!state.user || !state.db) return;
             
             const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
-            // Basic query, sorting handled in memory for unified view
             const q = query(toursRef); 
 
             onSnapshot(q, (snapshot) => {
@@ -80,10 +110,13 @@
                 snapshot.forEach((doc) => {
                     fetchedGigs.push({ firebaseId: doc.id, ...doc.data() });
                 });
-                state.cloudGigs = fetchedGigs;
                 
-                // Whenever cloud data changes, we check if we can remove local pendings that are now matches
+                state.cloudGigs = fetchedGigs;
+                state.isCloudLoaded = true; // MARKER: Cloud data is ready
+                
+                // NOW it is safe to sync
                 cleanLocalDuplicates();
+                runSmartSync(); 
                 renderUnifiedInterface();
             }, (error) => {
                 console.error("Snapshot error:", error);
@@ -93,25 +126,34 @@
 
         // --- SMART SYNC ENGINE ---
         async function runSmartSync() {
-            if (!state.user || !state.db || state.localGigs.length === 0) return;
+            // Guard clauses
+            if (!state.user || !state.db) return;
+            if (!state.isCloudLoaded) return; // Wait for cloud data!
+            if (state.localGigs.length === 0) return;
+            if (state.syncInProgress) return;
 
+            state.syncInProgress = true;
             updateSyncStatus("Syncing...", "text-blue-400 animate-pulse");
-            const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
             
+            const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
             const newLocalQueue = [];
             let uploadCount = 0;
 
             // Process queue
             for (const localGig of state.localGigs) {
-                // 1. Check for duplicate in CURRENT cloud data to avoid double upload
-                const isDuplicate = state.cloudGigs.some(cloudGig => 
-                    cloudGig.date === localGig.date && 
-                    cloudGig.venue.toUpperCase() === localGig.venue.toUpperCase()
-                );
+                // 1. ROBUST Duplicate Check
+                // Normalize strings (trim + uppercase) to ensure matches are found
+                const isDuplicate = state.cloudGigs.some(cloudGig => {
+                    const cDate = cloudGig.date;
+                    const cVenue = (cloudGig.venue || "").trim().toUpperCase();
+                    const lDate = localGig.date;
+                    const lVenue = (localGig.venue || "").trim().toUpperCase();
+                    return cDate === lDate && cVenue === lVenue;
+                });
 
                 if (isDuplicate) {
-                    console.log("Skipping duplicate:", localGig.venue);
-                    continue; // It exists in cloud, we drop the local copy
+                    console.log("Sync: Duplicate found in cloud, removing local copy:", localGig.venue);
+                    continue; // Skip upload, effectively removing it from queue
                 }
 
                 try {
@@ -130,38 +172,35 @@
             // 3. Update Local Storage
             state.localGigs = newLocalQueue;
             localStorage.setItem('frankPowellPending', JSON.stringify(state.localGigs));
+            state.syncInProgress = false;
             
             // 4. Update UI
-            updateSyncStatus(
-                state.localGigs.length > 0 ? `Pending: ${state.localGigs.length}` : "All Synced", 
-                state.localGigs.length > 0 ? "text-amber-400" : "text-gray-500"
-            );
-            
             if (uploadCount > 0) {
-                // Flash success
-                const el = document.getElementById('syncStatus');
-                if(el) {
-                    el.innerText = `Uploaded ${uploadCount} Items`;
-                    el.className = el.className.replace('text-gray-500', 'text-green-400');
-                    setTimeout(() => renderUnifiedInterface(), 2000);
-                }
+                updateSyncStatus(`Synced ${uploadCount} Items`, "text-green-400");
+                setTimeout(() => {
+                    updateSyncStatus(state.localGigs.length > 0 ? `Pending: ${state.localGigs.length}` : "All Synced", "text-gray-500");
+                }, 3000);
+            } else {
+                 updateSyncStatus(state.localGigs.length > 0 ? `Pending: ${state.localGigs.length}` : "All Synced", "text-gray-500");
             }
         }
 
         function cleanLocalDuplicates() {
-            // Removes local items if they perfectly match a cloud item (Cleanup after sync)
+            // Removes local items if they perfectly match a cloud item (Cleanup after sync or if cloud updated elsewhere)
+            if(!state.isCloudLoaded) return;
+
             const initialLen = state.localGigs.length;
+            
             state.localGigs = state.localGigs.filter(local => {
-                const existsInCloud = state.cloudGigs.some(cloud => 
-                    cloud.date === local.date && 
-                    cloud.venue.toUpperCase() === local.venue.toUpperCase()
-                );
+                const existsInCloud = state.cloudGigs.some(cloud => {
+                    return cloud.date === local.date && 
+                           (cloud.venue||"").trim().toUpperCase() === (local.venue||"").trim().toUpperCase();
+                });
                 return !existsInCloud;
             });
             
             if (state.localGigs.length !== initialLen) {
                 localStorage.setItem('frankPowellPending', JSON.stringify(state.localGigs));
-                updateSyncStatus("Synced", "text-gray-500");
             }
         }
 
@@ -199,8 +238,8 @@
             // 3. Render immediately
             renderUnifiedInterface();
 
-            // 4. Try to Sync if online
-            if (state.user && navigator.onLine) {
+            // 4. Try to Sync if online AND cloud is ready
+            if (state.user && navigator.onLine && state.isCloudLoaded) {
                 runSmartSync();
             } else {
                 updateSyncStatus(`Saved Offline (${state.localGigs.length})`, "text-amber-400");
@@ -231,7 +270,13 @@
             }
         };
 
-        window.manualSync = () => runSmartSync();
+        window.manualSync = () => {
+            if(!state.isCloudLoaded) {
+                alert("Please wait for cloud connection...");
+                return;
+            }
+            runSmartSync();
+        };
 
         // --- UI HELPERS ---
         function getInputs() {
@@ -265,14 +310,13 @@
         // --- RENDER UNIFIED LIST ---
         function renderUnifiedInterface() {
             // 1. Merge Lists
-            // We use the cloud data as truth, and add local items ONLY if they don't look like duplicates
-            // This prevents the visual "jump" where you see both for a second during sync
-            
             const displayList = [...state.cloudGigs.map(g => ({...g, source: 'cloud'}))];
             
+            // Check duplicates robustly during render too
             state.localGigs.forEach(local => {
                 const isAlreadyInCloud = state.cloudGigs.some(c => 
-                    c.date === local.date && c.venue.toUpperCase() === local.venue.toUpperCase()
+                    c.date === local.date && 
+                    (c.venue||"").trim().toUpperCase() === (local.venue||"").trim().toUpperCase()
                 );
                 if(!isAlreadyInCloud) {
                     displayList.push({...local, source: 'local'});
@@ -332,7 +376,8 @@
         window.addEventListener('online', () => {
             state.isOnline = true;
             updateStatus("Cloud: Connected", "text-green-400");
-            runSmartSync();
+            // Only run sync if we already loaded the cloud data previously
+            if(state.isCloudLoaded) runSmartSync();
         });
         window.addEventListener('offline', () => {
             state.isOnline = false;
@@ -481,7 +526,7 @@
 
         <!-- VERSION FOOTER -->
         <div class="mt-auto border-t border-gray-100 pt-4 text-center pb-6">
-            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v10.0</span></h1>
+            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v10.1</span></h1>
             <p class="text-[9px] text-gray-400 uppercase tracking-wider mt-1">Intelligent Hybrid Sync</p>
         </div>
     </div>
