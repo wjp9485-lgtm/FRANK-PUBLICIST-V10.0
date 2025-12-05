@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Frank Powell Live - NativeSync v12.0</title>
+    <title>Frank Powell Live - CloudVenues v13.0</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;700;900&family=Prata&display=swap" rel="stylesheet">
@@ -18,8 +18,7 @@
             deleteDoc, 
             doc, 
             onSnapshot, 
-            enableIndexedDbPersistence,
-            serverTimestamp 
+            enableIndexedDbPersistence 
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- FIREBASE CONFIGURATION ---
@@ -37,8 +36,9 @@
             user: null,
             db: null,
             auth: null,
-            gigs: [], // Single Source of Truth
-            unsubscribe: null,
+            gigs: [],     // Cloud Gigs
+            venues: [],   // Cloud Venues (New!)
+            listeners: [],
             appId: "default"
         };
 
@@ -50,17 +50,12 @@
                 state.auth = getAuth(app);
                 state.db = getFirestore(app);
 
-                // 2. ENABLE OFFLINE PERSISTENCE (The Magic Sauce)
-                // This allows the app to work offline seamlessly. 
-                // It caches data to IndexedDB automatically.
+                // 2. Offline Persistence
                 try {
                     await enableIndexedDbPersistence(state.db);
-                    console.log("Offline persistence enabled");
                 } catch (err) {
-                    if (err.code == 'failed-precondition') {
-                         console.warn("Persistence failed: Multiple tabs open.");
-                    } else if (err.code == 'unimplemented') {
-                         console.warn("Persistence not supported by browser.");
+                    if (err.code != 'failed-precondition' && err.code != 'unimplemented') {
+                         console.warn("Persistence warning:", err);
                     }
                 }
 
@@ -69,7 +64,12 @@
                     if (user) {
                         state.user = user;
                         updateStatus("Live Connection", "text-green-400");
-                        setupFirestoreListener();
+                        
+                        // Start Listening to BOTH collections
+                        setupDataListeners();
+                        
+                        // Optional: Migrate old local venues to cloud once
+                        migrateLocalVenues();
                     } else {
                         state.user = null;
                         signInAnonymously(state.auth).catch(e => {
@@ -87,54 +87,58 @@
 
         // --- FIRESTORE LOGIC ---
 
-        function setupFirestoreListener() {
+        function setupDataListeners() {
             if (!state.user || !state.db) return;
-            if (state.unsubscribe) state.unsubscribe();
-
-            const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
             
-            // This listener fires instantly when you write (Latency Compensation)
-            // AND instantly when the Cloud updates (Real-time Sync)
-            state.unsubscribe = onSnapshot(toursRef, { includeMetadataChanges: true }, (snapshot) => {
-                
+            // Clear old listeners if any
+            state.listeners.forEach(unsub => unsub());
+            state.listeners = [];
+
+            // 1. GIGS LISTENER
+            const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
+            const unsubTours = onSnapshot(toursRef, { includeMetadataChanges: true }, (snapshot) => {
                 const fetched = [];
                 let pendingWritesCount = 0;
 
                 snapshot.forEach(doc => {
                     const data = doc.data();
-                    const isPending = doc.metadata.hasPendingWrites; // TRUE if waiting to sync
+                    const isPending = doc.metadata.hasPendingWrites; 
                     if (isPending) pendingWritesCount++;
-
-                    fetched.push({ 
-                        id: doc.id, 
-                        ...data,
-                        isPending: isPending 
-                    });
+                    fetched.push({ id: doc.id, ...data, isPending });
                 });
 
                 state.gigs = fetched;
                 renderUnifiedInterface();
 
-                // Update Status UI based on metadata
-                if (pendingWritesCount > 0) {
-                    updateSyncStatus("Syncing Changes...", "text-amber-500 animate-pulse");
-                } else {
-                    updateSyncStatus("All Devices Synced", "text-gray-500");
-                }
-
-            }, (error) => {
-                console.error("Listener Error:", error);
-                updateStatus("Permission Error", "text-red-500");
+                if (pendingWritesCount > 0) updateSyncStatus("Syncing...", "text-amber-500 animate-pulse");
+                else updateSyncStatus("All Devices Synced", "text-gray-500");
             });
+
+            // 2. VENUES LISTENER (New!)
+            const venuesRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'venues');
+            const unsubVenues = onSnapshot(venuesRef, (snapshot) => {
+                const fetched = [];
+                snapshot.forEach(doc => {
+                    // Simple data pull
+                    fetched.push({ id: doc.id, ...doc.data() });
+                });
+
+                // Sort alphabetically
+                fetched.sort((a,b) => a.name.localeCompare(b.name));
+                state.venues = fetched;
+                
+                renderVenueSelect();
+            });
+
+            state.listeners.push(unsubTours, unsubVenues);
         }
 
-        // --- ACTIONS ---
+        // --- ACTIONS: GIGS ---
 
         window.addNewGig = async () => {
             const inputs = getInputs();
             if(!inputs.date.value || !inputs.venue.value) return alert("Date and Venue are required.");
 
-            // Format Time
             let timeStr = "TBA";
             if (inputs.startTime.value && inputs.endTime.value) timeStr = `${inputs.startTime.value} - ${inputs.endTime.value} PM`;
             else if (inputs.startTime.value) timeStr = `${inputs.startTime.value} PM`;
@@ -146,17 +150,13 @@
                 city: inputs.cityState.value.toUpperCase(),
                 note: inputs.note.value.toUpperCase(),
                 type: inputs.showType.value,
-                createdAt: new Date().toISOString() // Fallback timestamp
+                createdAt: new Date().toISOString()
             };
 
-            // DIRECT DB WRITE
-            // We don't save to local array manually. We trust the SDK.
-            // The listener will fire *immediately* with the new data (Optimistic UI).
             try {
                 const toursRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours');
                 await addDoc(toursRef, newGig);
                 
-                // Clear Inputs
                 inputs.venue.value = ""; 
                 inputs.cityState.value = ""; 
                 inputs.note.value = "";
@@ -170,15 +170,96 @@
 
         window.deleteGig = async (id) => {
             if(!confirm("Delete this gig? This will update all devices.")) return;
+            try {
+                await deleteDoc(doc(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours', id));
+            } catch(e) { alert("Delete failed: " + e.message); }
+        };
+
+        // --- ACTIONS: VENUES (New Cloud Logic) ---
+
+        window.saveCurrentVenue = async () => {
+            const inputs = getInputs();
+            const name = inputs.venue.value.trim().toUpperCase();
+            const city = inputs.cityState.value.trim().toUpperCase();
+
+            if (!name) return alert("Enter a venue name to save.");
+
+            // Check for duplicate in CLOUD list
+            const exists = state.venues.some(v => v.name === name);
+            if (exists) return alert("Venue already saved in cloud.");
 
             try {
-                const docRef = doc(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'tours', id);
-                await deleteDoc(docRef);
-            } catch(e) {
-                console.error(e);
-                alert("Delete failed: " + e.message);
+                const venuesRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'venues');
+                await addDoc(venuesRef, {
+                    name: name,
+                    city: city,
+                    createdAt: new Date().toISOString()
+                });
+                // No need to alert or reload, the listener handles the UI update
+            } catch (e) {
+                alert("Error saving venue: " + e.message);
             }
         };
+
+        window.deleteCurrentVenue = async () => {
+            const select = document.getElementById('savedVenues');
+            const venueId = select.value;
+            
+            if (!venueId) return alert("Select a venue to delete.");
+            if (!confirm("Remove this venue from the cloud for all devices?")) return;
+
+            try {
+                await deleteDoc(doc(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'venues', venueId));
+                // Clear inputs if they match
+                getInputs().venue.value = "";
+                getInputs().cityState.value = "";
+            } catch (e) {
+                alert("Error deleting: " + e.message);
+            }
+        };
+
+        window.loadSelectedVenue = () => {
+            const select = document.getElementById('savedVenues');
+            const id = select.value;
+            if (!id) return;
+
+            const venue = state.venues.find(v => v.id === id);
+            if (venue) {
+                const inputs = getInputs();
+                inputs.venue.value = venue.name;
+                inputs.cityState.value = venue.city;
+                // Trigger debounce manually
+                window.dispatchEvent(new Event('resize')); // Hack to trigger preview update
+            }
+        };
+
+        async function migrateLocalVenues() {
+            // Check if we have old local storage data
+            const localData = localStorage.getItem('frankPowellVenues');
+            if (localData) {
+                const venues = JSON.parse(localData);
+                if (venues.length > 0) {
+                    console.log("Migrating local venues to cloud...");
+                    const venuesRef = collection(state.db, 'artifacts', firebaseConfig.appId, 'public', 'data', 'venues');
+                    
+                    for (const v of venues) {
+                        // Check if exists in cloud already (by name)
+                        // Note: state.venues might not be populated yet, so we just fire and forget mostly
+                        // or better, just add them.
+                        try {
+                           await addDoc(venuesRef, { 
+                               name: v.name.toUpperCase(), 
+                               city: v.city.toUpperCase(),
+                               migrated: true 
+                           });
+                        } catch(e) { console.warn("Migration skip", e); }
+                    }
+                    // Clear local storage so we don't do this again
+                    localStorage.removeItem('frankPowellVenues');
+                    console.log("Migration complete.");
+                }
+            }
+        }
 
         // --- RENDER LOGIC ---
 
@@ -186,11 +267,8 @@
             // Sort by Date
             const list = [...state.gigs];
             list.sort((a,b) => new Date(a.date) - new Date(b.date));
-
-            // Update Global for Poster Canvas
             window.currentTourData = list;
             
-            // Render Sidebar List
             const sb = document.getElementById('tourListContainer');
             sb.innerHTML = '';
             
@@ -205,8 +283,6 @@
                 const isPast = dt < today;
                 const dateStr = dt.toLocaleDateString('en-US', {month:'short', day:'numeric'}).toUpperCase();
                 
-                // Native Pending Status
-                // If isPending is true, it means it's on this device but not the cloud yet (Amber)
                 let statusDot = gig.isPending ? 
                     `<span class="h-2 w-2 rounded-full bg-amber-500 animate-pulse mr-2" title="Syncing..."></span>` :
                     `<span class="h-2 w-2 rounded-full bg-green-500 mr-2" title="Live on Cloud"></span>`;
@@ -227,9 +303,23 @@
                         </button>
                     </div>`;
             });
-
-            // Trigger Canvas Update
             window.dispatchEvent(new CustomEvent('gigsUpdated'));
+        }
+
+        function renderVenueSelect() {
+            const select = document.getElementById('savedVenues');
+            // Save current selection if possible
+            const current = select.value;
+            
+            select.innerHTML = '<option value="">Select a venue (Cloud)...</option>';
+            state.venues.forEach(v => {
+                select.innerHTML += `<option value="${v.id}">${v.name} (${v.city})</option>`;
+            });
+
+            // Restore selection if it still exists
+            if (current && state.venues.some(v => v.id === current)) {
+                select.value = current;
+            }
         }
 
         // --- HELPERS ---
@@ -262,14 +352,8 @@
         }
 
         // --- NETWORK EVENTS ---
-        window.addEventListener('online', () => {
-             updateStatus("Live Connection", "text-green-400");
-             // No manual sync needed. The SDK handles it.
-        });
-
-        window.addEventListener('offline', () => {
-            updateStatus("Offline Mode", "text-amber-500");
-        });
+        window.addEventListener('online', () => updateStatus("Live Connection", "text-green-400"));
+        window.addEventListener('offline', () => updateStatus("Offline Mode", "text-amber-500"));
 
         // Start
         initApp();
@@ -355,15 +439,15 @@
             </div>
 
             <div class="bg-gray-100 p-4 border border-gray-200 rounded-sm">
-                <label class="block text-xs font-bold text-gray-500 mb-2 uppercase tracking-wide">Saved Venues (Local)</label>
+                <label class="block text-xs font-bold text-gray-500 mb-2 uppercase tracking-wide">Saved Venues (Cloud)</label>
                 <div class="flex gap-2 mb-3">
-                    <select id="savedVenues" onchange="loadSelectedVenue()" class="w-full border border-gray-300 rounded-none px-2 py-3 text-sm text-gray-700 bg-white">
-                        <option value="">Select a venue...</option>
+                    <select id="savedVenues" onchange="window.loadSelectedVenue()" class="w-full border border-gray-300 rounded-none px-2 py-3 text-sm text-gray-700 bg-white">
+                        <option value="">Loading Cloud Venues...</option>
                     </select>
                 </div>
                 <div class="flex gap-2">
-                    <button type="button" onclick="saveCurrentVenue()" class="flex-1 bg-gray-600 hover:bg-gray-700 active:scale-95 transform transition-transform text-white text-xs font-bold py-3 px-2 rounded-sm uppercase tracking-wider">Save Venue</button>
-                    <button type="button" onclick="deleteCurrentVenue()" class="flex-1 bg-gray-400 hover:bg-red-500 active:scale-95 transform transition-transform text-white text-xs font-bold py-3 px-2 rounded-sm uppercase tracking-wider">Delete</button>
+                    <button type="button" onclick="window.saveCurrentVenue()" class="flex-1 bg-gray-600 hover:bg-gray-700 active:scale-95 transform transition-transform text-white text-xs font-bold py-3 px-2 rounded-sm uppercase tracking-wider">Save Venue</button>
+                    <button type="button" onclick="window.deleteCurrentVenue()" class="flex-1 bg-gray-400 hover:bg-red-500 active:scale-95 transform transition-transform text-white text-xs font-bold py-3 px-2 rounded-sm uppercase tracking-wider">Delete</button>
                 </div>
             </div>
 
@@ -403,8 +487,8 @@
         </div>
 
         <div class="mt-auto border-t border-gray-100 pt-4 text-center pb-6">
-            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v12.0</span></h1>
-            <p class="text-[9px] text-gray-400 uppercase tracking-wider mt-1">Native Real-Time Sync</p>
+            <h1 class="text-xl font-black text-gray-800 uppercase tracking-widest">Generator <span class="text-amber-500">v13.0</span></h1>
+            <p class="text-[9px] text-gray-400 uppercase tracking-wider mt-1">Cloud Venues Active</p>
         </div>
     </div>
 
@@ -541,89 +625,6 @@
                 platinum: { accent: '#e5e4e2', accentDark: '#71797e', shadow: 'rgba(0,0,0,0.7)', gradient: ['#ffffff', '#e5e4e2', '#8e99a3', '#c9c9c9', '#ffffff'] }
             }
         };
-
-        // --- 2. LOCAL VENUE MANAGER ---
-        function getStore(k) { return JSON.parse(localStorage.getItem(k) || '[]'); }
-        function setStore(k, v) { localStorage.setItem(k, JSON.stringify(v)); }
-
-        function loadVenues() {
-            const v = getStore('frankPowellVenues');
-            venueSelect.innerHTML = '<option value="">Select a venue...</option>';
-            v.forEach((item, i) => venueSelect.innerHTML += `<option value="${i}">${item.name} (${item.city})</option>`);
-        }
-
-        function saveCurrentVenue() {
-            const name = inputs.venue.value.trim().toUpperCase();
-            const city = inputs.cityState.value.trim().toUpperCase();
-            if (!name) return alert("Enter name.");
-            const v = getStore('frankPowellVenues');
-            const idx = v.findIndex(x => x.name === name);
-            if (idx > -1) v[idx] = {name, city}; else v.push({name, city});
-            setStore('frankPowellVenues', v); loadVenues();
-        }
-
-        function deleteCurrentVenue() {
-            if (venueSelect.value === "") return;
-            if(!confirm("Delete venue?")) return;
-            const v = getStore('frankPowellVenues');
-            v.splice(venueSelect.value, 1);
-            setStore('frankPowellVenues', v); loadVenues();
-            inputs.venue.value = ""; inputs.cityState.value = "";
-            debouncedUpdate();
-        }
-
-        function loadSelectedVenue() {
-            const v = getStore('frankPowellVenues')[venueSelect.value];
-            if (v) { inputs.venue.value = v.name; inputs.cityState.value = v.city; debouncedUpdate(); }
-        }
-
-        // --- 4. UI RENDERING (Poster Side) ---
-        window.addEventListener('gigsUpdated', renderPosterList);
-
-        function renderPosterList() {
-            const dates = window.currentTourData || [];
-            const cv = document.getElementById('tourCanvasList');
-            cv.innerHTML = '';
-
-            if (dates.length === 0) {
-                cv.innerHTML = '<p class="text-white text-center text-3xl font-serif-title mt-20">Coming Soon</p>';
-                return;
-            }
-
-            const today = new Date(); today.setHours(0,0,0,0);
-
-            // POSTER LOGIC
-            const pastDates = dates.filter(d => new Date(d.date+'T00:00:00') < today);
-            const futureDates = dates.filter(d => new Date(d.date+'T00:00:00') >= today);
-            const visiblePast = pastDates.slice(-2); 
-            const visibleFuture = futureDates.slice(0, 7);
-            const displayList = [...visiblePast, ...visibleFuture];
-
-            displayList.forEach((d) => {
-                const dt = new Date(d.date+'T00:00:00');
-                const isPast = dt < today;
-                const m = dt.toLocaleDateString('en-US', {month:'short'}).toUpperCase();
-                const day = dt.toLocaleDateString('en-US', {day:'numeric'});
-                const rowClass = isPast ? 'past-gig-row' : '';
-                const textClass = isPast ? 'past-gig-text' : '';
-                const venueLength = d.venue.length;
-                let venueSize = venueLength > 25 ? "1.4em" : (venueLength > 15 ? "1.8em" : "2.2em");
-                let timeSize = d.time.length > 10 ? "1.0em" : (d.time.length > 8 ? "1.2em" : "1.5em");
-
-                cv.innerHTML += `
-                    <div class="tour-item-row flex items-center justify-between py-3 border-b border-gray-800 w-full ${rowClass}">
-                        <div class="flex items-center gap-10 w-full ${textClass}">
-                            <div class="w-32 text-right font-bold text-2em text-white font-serif-title tracking-tight shrink-0 leading-none whitespace-nowrap" style="font-size: 2.5em;">${m} <span class="text-accent">${day}</span></div>
-                            <div class="w-48 text-center text-accent font-mono uppercase tracking-widest shrink-0 leading-none whitespace-nowrap" style="font-size: ${timeSize};">${d.time}</div>
-                            <div class="flex-grow text-left overflow-hidden" style="padding-bottom: 4px;">
-                                <div class="text-gray-200 font-bold uppercase tracking-wide truncate" style="font-size: ${venueSize}; line-height: 1.7; padding-bottom: 0.1em;">${d.venue}</div>
-                                <div class="text-gray-500 font-light uppercase tracking-widest leading-none" style="font-size: 1.3em; line-height: 1.5;">${d.city}</div>
-                            </div>
-                        </div>
-                    </div>`;
-            });
-            setTimeout(fitTourList, 50);
-        }
 
         // --- 5. STANDARD FUNCTIONS ---
         function initTimeOptions() {
@@ -837,7 +838,6 @@
         window.addEventListener('resize', scalePreview);
         window.addEventListener('load', () => {
             initTimeOptions();
-            loadVenues();
             const today = new Date().toISOString().split('T')[0];
             inputs.date.value = today;
             updatePoster(); 
